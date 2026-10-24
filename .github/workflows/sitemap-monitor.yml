@@ -6,6 +6,7 @@ on:
     - cron: '5 3 25 10 *'
 permissions:
   contents: write
+  id-token: write
 concurrency:
   group: sitemap-monitor
   cancel-in-progress: false
@@ -14,11 +15,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Installer le client OAuth Google
-        run: python -m pip install --disable-pip-version-check 'google-auth[requests]>=2.40,<3'
+      - name: Authentification Google sans cle permanente
+        id: google_auth
+        continue-on-error: true
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: vocalys-play-billing
+          workload_identity_provider: projects/851815718809/locations/global/workloadIdentityPools/legibat-sitemap/providers/github
+          service_account: legibat-sitemap-monitor@vocalys-play-billing.iam.gserviceaccount.com
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/webmasters.readonly
+          access_token_lifetime: 600s
+          create_credentials_file: false
+          export_environment_variables: false
       - name: Verifier Search Console et enregistrer le rapport
         env:
-          GSC_CREDENTIALS_JSON: ${{ secrets.GSC_CREDENTIALS_JSON }}
+          GSC_ACCESS_TOKEN: ${{ steps.google_auth.outputs.access_token }}
           GH_TOKEN: ${{ github.token }}
           MONITOR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         shell: bash
@@ -99,31 +111,16 @@ jobs:
 
 
           def google_check():
-              encoded = os.environ.get("GSC_CREDENTIALS_JSON", "").strip()
-              if not encoded:
+              token = os.environ.get("GSC_ACCESS_TOKEN", "").strip()
+              if not token:
                   return {"status": "blocked_missing_credentials", "indexing_confirmed": False}
               try:
-                  from google.auth.transport.requests import Request as AuthRequest
-                  from google.oauth2 import service_account
-                  from google.oauth2.credentials import Credentials
-                  from google.auth.exceptions import GoogleAuthError
-                  info = json.loads(encoded)
-                  if info.get("type") == "service_account":
-                      credentials = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
-                  elif info.get("type") == "authorized_user":
-                      credentials = Credentials.from_authorized_user_info(info, scopes=SCOPES)
-                  else:
-                      raise ValueError("Unsupported credentials type")
-                  # Keep credential exchange destinations fixed, even for misconfigured secrets.
-                  if info.get("token_uri", "https://oauth2.googleapis.com/token") != "https://oauth2.googleapis.com/token":
-                      raise ValueError("Unexpected token endpoint")
-                  credentials.refresh(AuthRequest())
                   endpoint = "https://www.googleapis.com/webmasters/v3/sites/" + quote(BASE, safe="") + "/sitemaps/" + quote(SITEMAP, safe="")
-                  _, body, _ = request(endpoint, headers={"Authorization": "Bearer " + credentials.token})
+                  _, body, _ = request(endpoint, headers={"Authorization": "Bearer " + token})
                   return interpret_sitemap(json.loads(body))
               except HTTPError as exc:
                   return {"status": "blocked_api_access" if exc.code in (401, 403) else "google_api_error", "http_status": exc.code}
-              except (ValueError, KeyError, ImportError, URLError, TimeoutError):
+              except (ValueError, KeyError, URLError, TimeoutError):
                   return {"status": "blocked_credentials_or_connection"}
               except Exception:
                   # Do not print OAuth errors: provider messages may include sensitive context.
