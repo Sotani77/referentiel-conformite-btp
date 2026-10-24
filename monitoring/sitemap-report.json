@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-24T03:26:03.271797+00:00",
+  "checked_at": "2026-10-24T03:39:55.506059+00:00",
   "runner": "GitHub Actions",
   "property": "https://sotani77.github.io/referentiel-conformite-btp/",
   "sitemap": "https://sotani77.github.io/referentiel-conformite-btp/sitemap.xml",
@@ -13,6 +13,6 @@
     "status": "blocked_missing_credentials",
     "indexing_confirmed": false
   },
-  "run_url": "https://github.com/Sotani77/referentiel-conformite-btp/actions/runs/40058269752",
+  "run_url": "https://github.com/Sotani77/referentiel-conformite-btp/actions/runs/40059218223",
   "note": "Public HTTP success is not Google discovery. Sitemap URL counts are not indexation counts."
 }
