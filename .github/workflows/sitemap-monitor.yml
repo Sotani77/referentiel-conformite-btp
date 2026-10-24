@@ -1,0 +1,187 @@
+name: Controle sitemap Legibat
+on:
+  workflow_dispatch:
+  schedule:
+    # 25 octobre 2026, 04:05 Paris = 03:05 UTC (passage heure d'hiver).
+    - cron: '5 3 25 10 *'
+permissions:
+  contents: write
+concurrency:
+  group: sitemap-monitor
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Installer le client OAuth Google
+        run: python -m pip install --disable-pip-version-check 'google-auth[requests]>=2.40,<3'
+      - name: Verifier Search Console et enregistrer le rapport
+        env:
+          GSC_CREDENTIALS_JSON: ${{ secrets.GSC_CREDENTIALS_JSON }}
+          GH_TOKEN: ${{ github.token }}
+          MONITOR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          """Read-only Search Console check; publish a credential-free report on GitHub."""
+          from __future__ import annotations
+
+          import base64
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+          import xml.etree.ElementTree as ET
+
+          BASE = "https://sotani77.github.io/referentiel-conformite-btp/"
+          SITEMAP = BASE + "sitemap.xml"
+          EXPECTED = {BASE} | {BASE + name for name in (
+              "grille-preparation-consuel-2026.pdf",
+              "modele-mise-en-demeure-chantier-2026.pdf",
+              "liste-controle-attestation-decennale-2026.pdf",
+              "guide-recours-malfacons-travaux-2026.pdf",
+              "bareme-reperes-eligibilite-eco-ptz-2026.pdf",
+          )}
+          SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
+          REPO = "Sotani77/referentiel-conformite-btp"
+          REPORT_PATH = "monitoring/sitemap-report.json"
+
+
+          def request(url, *, headers=None, method="GET", payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              head = {"User-Agent": "Legibat-Sitemap-Monitor/1.0"}
+              head.update(headers or {})
+              if data is not None:
+                  head["Content-Type"] = "application/json"
+              with urlopen(Request(url, data=data, headers=head, method=method), timeout=30) as response:
+                  body = response.read(2_000_001)
+                  if len(body) > 2_000_000:
+                      raise ValueError("Response too large")
+                  return response.status, body, dict(response.headers)
+
+
+          def public_check():
+              try:
+                  code, body, _ = request(SITEMAP)
+                  root = ET.fromstring(body)
+                  locs = [e.text for e in root.findall("{http://www.sitemaps.org/schemas/sitemap/0.9}url/{http://www.sitemaps.org/schemas/sitemap/0.9}loc")]
+                  return {"http_status": code, "url_count": len(locs),
+                          "expected_urls_match": len(locs) == 6 and set(locs) == EXPECTED}
+              except (HTTPError, URLError, ValueError, ET.ParseError, TimeoutError):
+                  return {"expected_urls_match": False, "error": "Public sitemap fetch or XML validation failed"}
+
+
+          def interpret_sitemap(data):
+              """The deprecated `indexed` field is deliberately ignored."""
+              counts = [int(c["submitted"]) for c in data.get("contents", [])
+                        if c.get("type") == "web" and "submitted" in c]
+              count = sum(counts) if counts else None
+              errors = int(data.get("errors", 0))
+              downloaded = data.get("lastDownloaded")
+              pending = data.get("isPending", False)
+              if errors:
+                  status = "google_reports_errors"
+              elif pending or not downloaded:
+                  status = "pending_or_not_downloaded"
+              elif count == 6 and data.get("type") in ("sitemap", "urlList"):
+                  status = "six_urls_recognized"
+              else:
+                  status = "partial_or_unknown"
+              return {"status": status, "web_urls_reported": count, "errors": errors,
+                      "warnings": int(data.get("warnings", 0)), "is_pending": pending,
+                      "last_downloaded": downloaded, "last_submitted": data.get("lastSubmitted"),
+                      "sitemap_type": data.get("type"), "indexing_confirmed": False,
+                      "count_source": "Search Console API contents[type=web].submitted"}
+
+
+          def google_check():
+              encoded = os.environ.get("GSC_CREDENTIALS_JSON", "").strip()
+              if not encoded:
+                  return {"status": "blocked_missing_credentials", "indexing_confirmed": False}
+              try:
+                  from google.auth.transport.requests import Request as AuthRequest
+                  from google.oauth2 import service_account
+                  from google.oauth2.credentials import Credentials
+                  from google.auth.exceptions import GoogleAuthError
+                  info = json.loads(encoded)
+                  if info.get("type") == "service_account":
+                      credentials = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+                  elif info.get("type") == "authorized_user":
+                      credentials = Credentials.from_authorized_user_info(info, scopes=SCOPES)
+                  else:
+                      raise ValueError("Unsupported credentials type")
+                  # Keep credential exchange destinations fixed, even for misconfigured secrets.
+                  if info.get("token_uri", "https://oauth2.googleapis.com/token") != "https://oauth2.googleapis.com/token":
+                      raise ValueError("Unexpected token endpoint")
+                  credentials.refresh(AuthRequest())
+                  endpoint = "https://www.googleapis.com/webmasters/v3/sites/" + quote(BASE, safe="") + "/sitemaps/" + quote(SITEMAP, safe="")
+                  _, body, _ = request(endpoint, headers={"Authorization": "Bearer " + credentials.token})
+                  return interpret_sitemap(json.loads(body))
+              except HTTPError as exc:
+                  return {"status": "blocked_api_access" if exc.code in (401, 403) else "google_api_error", "http_status": exc.code}
+              except (ValueError, KeyError, ImportError, URLError, TimeoutError):
+                  return {"status": "blocked_credentials_or_connection"}
+              except Exception:
+                  # Do not print OAuth errors: provider messages may include sensitive context.
+                  return {"status": "blocked_authentication_or_api_error"}
+
+
+          def publish_report(report):
+              token = os.environ.get("GH_TOKEN")
+              if not token:
+                  return False
+              if os.environ.get("GITHUB_REPOSITORY") != REPO:
+                  raise ValueError("Unexpected repository; report publication refused")
+              endpoint = f"https://api.github.com/repos/{REPO}/contents/{REPORT_PATH}"
+              headers = {"Authorization": "Bearer " + token,
+                         "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+              payload = {"message": "Record cloud sitemap check [skip ci]", "branch": "main",
+                         "content": base64.b64encode((json.dumps(report, indent=2, ensure_ascii=False) + "\n").encode()).decode()}
+              try:
+                  _, body, _ = request(endpoint + "?ref=main", headers=headers)
+                  payload["sha"] = json.loads(body)["sha"]
+              except HTTPError as exc:
+                  if exc.code != 404:
+                      raise
+              request(endpoint, headers=headers, method="PUT", payload=payload)
+              return True
+
+
+          def main():
+              now = datetime.now(timezone.utc)
+              # GitHub cron has no year field. This prevents another check in a later year.
+              if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and now.year != 2026:
+                  print("One-time October 2026 check: no further execution.")
+                  return 0
+              report = {"checked_at": now.isoformat(), "runner": "GitHub Actions" if os.environ.get("GITHUB_ACTIONS") else "local_test",
+                        "property": BASE, "sitemap": SITEMAP, "expected_url_count": 6,
+                        "public_sitemap": public_check(), "search_console": google_check(),
+                        "run_url": os.environ.get("MONITOR_RUN_URL"),
+                        "note": "Public HTTP success is not Google discovery. Sitemap URL counts are not indexation counts."}
+              Path("sitemap-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+              print(json.dumps(report, indent=2, ensure_ascii=False))
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  status = report["search_console"]["status"]
+                  count = report["search_console"].get("web_urls_reported")
+                  with open(summary, "a", encoding="utf-8") as out:
+                      out.write(f"### Contrôle du sitemap\n\nÉtat Search Console : **{status}**.\n\nURL reconnues dans le sitemap : **{count if count is not None else 'non vérifiable'} / 6**.\n\nContrôle UTC : {report['checked_at']}.\n\nLa découverte ne prouve pas l’indexation.\n")
+              try:
+                  published = publish_report(report)
+                  if os.environ.get("GITHUB_ACTIONS") and not published:
+                      print("Report publication unavailable.")
+                      return 2
+              except (HTTPError, URLError, ValueError, KeyError, TimeoutError):
+                  print("Report publication failed; consult this workflow run's summary.")
+                  return 2
+              return 0 if report["public_sitemap"].get("expected_urls_match") and report["search_console"]["status"] == "six_urls_recognized" else 1
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+
+          PY
