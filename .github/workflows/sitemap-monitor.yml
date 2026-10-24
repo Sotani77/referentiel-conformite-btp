@@ -182,3 +182,164 @@ jobs:
               raise SystemExit(main())
 
           PY
+      - name: Envoyer le resultat par e-mail
+        if: ${{ always() }}
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          """Send one transactional result email per GitHub workflow attempt via Resend."""
+          from __future__ import annotations
+
+          import html
+          import json
+          import os
+          import time
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.error import HTTPError, URLError
+          from urllib.request import Request, urlopen
+          from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+          REPO = "Sotani77/referentiel-conformite-btp"
+          BASE = "https://sotani77.github.io/referentiel-conformite-btp/"
+          SITEMAP = BASE + "sitemap.xml"
+          RECIPIENT = "contact@vocalys.pro"
+          SENDER = "Legibat - Suivi sitemap <notifications@legibat.fr>"
+          LABELS = {
+              "six_urls_recognized": "Google reconnaît les six URL du sitemap",
+              "pending_or_not_downloaded": "Sitemap encore en attente chez Google",
+              "google_reports_errors": "Google signale une erreur sur le sitemap",
+              "partial_or_unknown": "Résultat Google partiel ou encore indéterminé",
+              "blocked_missing_credentials": "Contrôle Google bloqué : authentification indisponible",
+              "blocked_api_access": "Contrôle Google bloqué : accès API refusé",
+              "google_api_error": "Contrôle Google bloqué : erreur API",
+              "blocked_credentials_or_connection": "Contrôle Google bloqué : connexion indisponible",
+              "blocked_authentication_or_api_error": "Contrôle Google bloqué : authentification ou API",
+              "monitor_failed": "Contrôle interrompu : rapport indisponible",
+          }
+
+
+          def paris_date(value):
+              if not value:
+                  return "non disponible"
+              try:
+                  stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                  if stamp.tzinfo is None:
+                      return "non disponible"
+                  try:
+                      return stamp.astimezone(ZoneInfo("Europe/Paris")).strftime("%d/%m/%Y à %H:%M:%S (%Z, Paris)")
+                  except ZoneInfoNotFoundError:
+                      return stamp.astimezone(timezone.utc).strftime("%d/%m/%Y à %H:%M:%S UTC")
+              except (ValueError, TypeError):
+                  return "non disponible"
+
+
+          def load_report(path, run_url):
+              try:
+                  report = json.loads(Path(path).read_text(encoding="utf-8"))
+                  if not isinstance(report, dict):
+                      raise ValueError("Invalid report")
+                  if report.get("property") != BASE or report.get("sitemap") != SITEMAP or report.get("run_url") != run_url:
+                      raise ValueError("Unexpected report")
+                  if not isinstance(report.get("search_console"), dict) or not isinstance(report.get("public_sitemap"), dict):
+                      raise ValueError("Incomplete report")
+                  return report
+              except (OSError, ValueError, TypeError):
+                  return {"checked_at": datetime.now(timezone.utc).isoformat(), "property": BASE,
+                          "sitemap": SITEMAP, "run_url": run_url, "public_sitemap": {},
+                          "search_console": {"status": "monitor_failed"}}
+
+
+          def email_payload(report):
+              google = report["search_console"]
+              public = report["public_sitemap"]
+              status = google.get("status", "monitor_failed")
+              title = LABELS.get(status, "Contrôle Google : résultat indéterminé")
+              if public.get("expected_urls_match") is False:
+                  title = "Anomalie du sitemap public — " + title
+              count = google.get("web_urls_reported")
+              count_text = f"{count} / 6" if count is not None else "non disponible (6 attendues)"
+              lines = [title, "", f"Contrôle : {paris_date(report.get('checked_at'))}",
+                       f"URL reconnues par Google dans le sitemap : {count_text}",
+                       f"Erreurs Google : {google.get('errors', 'non disponible')}",
+                       f"Avertissements Google : {google.get('warnings', 'non disponible')}",
+                       f"Dernière récupération Google : {paris_date(google.get('last_downloaded'))}",
+                       f"Sitemap public : HTTP {public.get('http_status', 'non disponible')}, {public.get('url_count', 'non disponible')} URL",
+                       "", f"Sitemap : {SITEMAP}", f"Rapport du contrôle : {report['run_url']}", "",
+                       "Le nombre d’URL reconnues dans le sitemap ne prouve pas leur indexation dans les résultats de recherche.",
+                       "Un accès HTTP 200 au sitemap public ne prouve pas sa découverte par Google.", "",
+                       "Notification automatique demandée pour le contrôle Legibat. Elle est envoyée depuis GitHub Actions, même si votre ordinateur et Codex sont fermés."]
+              text = "\n".join(lines)
+              body = ('<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>'
+                      + html.escape(title) + '</title></head><body style="font-family:Arial,sans-serif;line-height:1.6;color:#172b40;max-width:640px;margin:24px auto;padding:0 20px">'
+                      + '<h1 style="font-size:23px">' + html.escape(title) + '</h1>'
+                      + ''.join('<p style="margin:8px 0">' + html.escape(line) + '</p>' for line in lines[2:] if line)
+                      + '<p><a style="display:inline-block;padding:12px 18px;background:#174f76;color:white;text-decoration:none;border-radius:5px" href="'
+                      + html.escape(report['run_url'], quote=True) + '">Consulter le contrôle GitHub</a></p></body></html>')
+              return {"from": SENDER, "to": [RECIPIENT], "reply_to": RECIPIENT,
+                      "subject": "[Legibat] " + title, "text": text, "html": body,
+                      "tags": [{"name": "category", "value": "sitemap-monitor"}]}
+
+
+          def send_email(payload, api_key, idempotency_key):
+              data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+              headers = {"Authorization": "Bearer " + api_key, "Content-Type": "application/json",
+                         "User-Agent": "Legibat-Sitemap-Monitor/1.1", "Idempotency-Key": idempotency_key}
+              for attempt in range(4):
+                  try:
+                      with urlopen(Request("https://api.resend.com/emails", data=data, headers=headers, method="POST"), timeout=30) as response:
+                          result = json.loads(response.read(100_000))
+                      if not isinstance(result.get("id"), str) or not result["id"]:
+                          return {"status": "failed", "reason": "invalid_provider_response"}
+                      return {"status": "accepted", "email_id": result["id"], "attempts": attempt + 1,
+                              "delivery_confirmed": False}
+                  except HTTPError as exc:
+                      retryable = exc.code in (408, 429) or exc.code >= 500
+                      if not retryable or attempt == 3:
+                          return {"status": "failed", "reason": "provider_http_error", "http_status": exc.code}
+                      try:
+                          delay = min(60, max(2 ** (attempt + 1), int(exc.headers.get("Retry-After", "0"))))
+                      except (ValueError, TypeError):
+                          delay = 2 ** (attempt + 1)
+                  except (URLError, TimeoutError, ConnectionError):
+                      if attempt == 3:
+                          return {"status": "failed", "reason": "provider_unreachable"}
+                      delay = 2 ** (attempt + 1)
+                  except (ValueError, KeyError, TypeError):
+                      return {"status": "failed", "reason": "invalid_provider_response"}
+                  time.sleep(delay)
+
+
+          def main():
+              if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and datetime.now(timezone.utc).year != 2026:
+                  print("One-time October 2026 check: no email in later years.")
+                  return 0
+              if os.environ.get("GITHUB_REPOSITORY") != REPO:
+                  print("Email refused outside the configured repository.")
+                  return 2
+              run_id = os.environ.get("GITHUB_RUN_ID", "")
+              run_attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "")
+              if not run_id.isdigit() or not run_attempt.isdigit():
+                  print("Email refused without a valid GitHub run identity.")
+                  return 2
+              run_url = f"https://github.com/{REPO}/actions/runs/{run_id}"
+              report = load_report("sitemap-report.json", run_url)
+              key = os.environ.get("RESEND_API_KEY", "").strip()
+              result = send_email(email_payload(report), key, f"legibat-sitemap/{run_id}/{run_attempt}") if key else {"status": "failed", "reason": "missing_resend_api_key"}
+              result.update({"run_url": run_url, "checked_at": report["checked_at"], "search_console_status": report["search_console"].get("status")})
+              Path("email-notification.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+              print(json.dumps(result, indent=2))
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as out:
+                      label = "Acceptée par le service d’envoi (livraison à confirmer)" if result["status"] == "accepted" else "Échec de l’envoi : " + result["reason"]
+                      out.write("\n### Notification e-mail\n\n" + label + ".\n\nIdentifiant : " + result.get("email_id", "aucun") + ".\n")
+              return 0 if result["status"] == "accepted" else 1
+
+
+          if __name__ == "__main__":
+              raise SystemExit(main())
+
+          PY
