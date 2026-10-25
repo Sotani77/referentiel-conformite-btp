@@ -2,8 +2,9 @@ name: Controle sitemap Legibat
 on:
   workflow_dispatch:
   schedule:
-    # Controle unique le 26 octobre 2026, 11:45 Paris = 10:45 UTC.
-    - cron: '45 10 26 10 *'
+    # Chaque jour a 11:45 Paris; notifications uniquement sur changement ou echec.
+    - cron: '45 11 * * *'
+      timezone: 'Europe/Paris'
 permissions:
   contents: write
   id-token: write
@@ -15,33 +16,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Authentification Google sans cle permanente
-        id: google_auth
-        continue-on-error: true
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
-        with:
-          project_id: vocalys-play-billing
-          workload_identity_provider: projects/851815718809/locations/global/workloadIdentityPools/legibat-sitemap/providers/github
-          service_account: legibat-sitemap-monitor@vocalys-play-billing.iam.gserviceaccount.com
-          token_format: access_token
-          access_token_scopes: https://www.googleapis.com/auth/webmasters.readonly
-          access_token_lifetime: 600s
-          create_credentials_file: false
-          export_environment_variables: false
-      - name: Verifier Search Console et enregistrer le rapport
-        env:
-          GSC_ACCESS_TOKEN: ${{ steps.google_auth.outputs.access_token }}
-          GH_TOKEN: ${{ github.token }}
-          MONITOR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      - name: Preparer le controle quotidien
         shell: bash
         run: |
-          python - <<'PY'
+          cat > monitor_sitemap.py <<'PY'
           """Read-only Search Console check; publish a credential-free report on GitHub."""
           from __future__ import annotations
 
           import base64
           import json
           import os
+          import sys
           from datetime import datetime, timezone
           from pathlib import Path
           from urllib.error import HTTPError, URLError
@@ -61,6 +46,110 @@ jobs:
           SCOPES = ["https://www.googleapis.com/auth/webmasters.readonly"]
           REPO = "Sotani77/referentiel-conformite-btp"
           REPORT_PATH = "monitoring/sitemap-report.json"
+          HEALTHY_STATUSES = {"pending_or_not_downloaded", "partial_or_unknown", "six_urls_recognized"}
+
+
+          def valid_report(report):
+              return (isinstance(report, dict) and report.get("property") == BASE
+                      and report.get("sitemap") == SITEMAP and report.get("runner") == "GitHub Actions"
+                      and isinstance(report.get("search_console"), dict)
+                      and isinstance(report.get("public_sitemap"), dict))
+
+
+          def state_signature(report):
+              """Compare outcomes, not run timestamps or routine Google recrawls."""
+              google = report.get("search_console", {})
+              public = report.get("public_sitemap", {})
+              return {"google": {key: google.get(key) for key in (
+                          "status", "web_urls_reported", "errors", "warnings", "is_pending", "sitemap_type", "http_status")},
+                      "google_has_download": bool(google.get("last_downloaded")),
+                      "public": {key: public.get(key) for key in ("http_status", "url_count", "expected_urls_match")},
+                      "monitoring_errors": sorted(report.get("monitoring_errors") or [])}
+
+
+          def goal_reached(report):
+              google = report.get("search_console", {})
+              return (google.get("status") == "six_urls_recognized" and google.get("web_urls_reported") == 6
+                      and google.get("errors") == 0 and not google.get("is_pending")
+                      and bool(google.get("last_downloaded"))
+                      and report.get("public_sitemap", {}).get("expected_urls_match") is True)
+
+
+          def check_failed(report):
+              return (report.get("search_console", {}).get("status") not in HEALTHY_STATUSES
+                      or report.get("public_sitemap", {}).get("expected_urls_match") is not True
+                      or bool(report.get("monitoring_errors")))
+
+
+          def completed(report):
+              return (valid_report(report) and goal_reached(report)
+                      and report.get("monitoring", {}).get("completed") is True
+                      and report.get("notification", {}).get("email", {}).get("status") == "accepted")
+
+
+          def previous_report():
+              try:
+                  value = json.loads(Path("previous-report.json").read_text(encoding="utf-8"))
+                  return value if valid_report(value) else None
+              except (OSError, ValueError, TypeError):
+                  return None
+
+
+          def apply_policy(report, previous=None):
+              changed = bool(previous and state_signature(previous) != state_signature(report))
+              failed = check_failed(report)
+              retry = bool(previous and previous.get("notification", {}).get("required")
+                           and previous.get("notification", {}).get("email", {}).get("status") != "accepted")
+              reasons = (["state_changed"] if changed else []) + (["check_failed"] if failed else [])
+              if retry:
+                  reasons.append("previous_email_failed")
+              if goal_reached(report) and not completed(previous or {}):
+                  reasons.append("goal_reached")
+              run_id = os.environ.get("GITHUB_RUN_ID", "local")
+              attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
+              event_id = f"{run_id}/{attempt}"
+              report["policy_version"] = 2
+              report["notification"] = {"required": bool(reasons), "reasons": reasons,
+                                        "state_changed": changed, "check_failed": failed, "event_id": event_id,
+                                        "email": {"status": "pending" if reasons else "skipped_unchanged"}}
+              report["monitoring"] = {"goal_reached": goal_reached(report), "completed": False}
+              history = list((previous or {}).get("events", []))
+              history = [event for event in history if isinstance(event, dict) and event.get("id") != event_id]
+              if reasons:
+                  history.append({"id": event_id, "checked_at": report["checked_at"], "run_url": report["run_url"],
+                                  "reasons": reasons, "check_failed": failed, "search_console": report["search_console"],
+                                  "public_sitemap": report["public_sitemap"],
+                                  "monitoring_errors": report.get("monitoring_errors", []),
+                                  "email": {"status": "pending"}})
+              report["events"] = history[-180:]
+              return report
+
+
+          def gate():
+              """Load durable state before OAuth; completed monitors do no further checks."""
+              should_run = True
+              try:
+                  token = os.environ.get("GH_TOKEN", "")
+                  if not token or os.environ.get("GITHUB_REPOSITORY") != REPO:
+                      raise ValueError("Missing repository authorization")
+                  endpoint = f"https://api.github.com/repos/{REPO}/contents/{REPORT_PATH}?ref=main"
+                  _, body, _ = request(endpoint, headers={"Authorization": "Bearer " + token,
+                                      "Accept": "application/vnd.github+json", "Cache-Control": "no-cache"})
+                  document = json.loads(body)
+                  previous = json.loads(base64.b64decode(document["content"]))
+                  if not valid_report(previous):
+                      raise ValueError("Invalid previous report")
+                  Path("previous-report.json").write_text(json.dumps(previous), encoding="utf-8")
+                  should_run = not completed(previous)
+              except Exception:
+                  # No provider exception text: it could include authorization context.
+                  Path("previous-read-error.txt").write_text("previous_report_unavailable", encoding="utf-8")
+              output = os.environ.get("GITHUB_OUTPUT")
+              if output:
+                  with open(output, "a", encoding="utf-8") as out:
+                      out.write(f"should_run={'true' if should_run else 'false'}\n")
+              print("Daily check enabled." if should_run else "Six URLs recognized; monitoring already completed. No further Google request or email.")
+              return 0
 
 
           def request(url, *, headers=None, method="GET", payload=None):
@@ -150,15 +239,13 @@ jobs:
 
           def main():
               now = datetime.now(timezone.utc)
-              # GitHub cron has no year field. This prevents another check in a later year.
-              if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and now.year != 2026:
-                  print("One-time October 2026 check: no further execution.")
-                  return 0
               report = {"checked_at": now.isoformat(), "runner": "GitHub Actions" if os.environ.get("GITHUB_ACTIONS") else "local_test",
                         "property": BASE, "sitemap": SITEMAP, "expected_url_count": 6,
                         "public_sitemap": public_check(), "search_console": google_check(),
                         "run_url": os.environ.get("MONITOR_RUN_URL"),
                         "note": "Public HTTP success is not Google discovery. Sitemap URL counts are not indexation counts."}
+              report["monitoring_errors"] = ["previous_report_unavailable"] if Path("previous-read-error.txt").exists() else []
+              apply_policy(report, previous_report())
               Path("sitemap-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
               print(json.dumps(report, indent=2, ensure_ascii=False))
               summary = os.environ.get("GITHUB_STEP_SUMMARY")
@@ -167,28 +254,16 @@ jobs:
                   count = report["search_console"].get("web_urls_reported")
                   with open(summary, "a", encoding="utf-8") as out:
                       out.write(f"### Contrôle du sitemap\n\nÉtat Search Console : **{status}**.\n\nURL reconnues dans le sitemap : **{count if count is not None else 'non vérifiable'} / 6**.\n\nContrôle UTC : {report['checked_at']}.\n\nLa découverte ne prouve pas l’indexation.\n")
-              try:
-                  published = publish_report(report)
-                  if os.environ.get("GITHUB_ACTIONS") and not published:
-                      print("Report publication unavailable.")
-                      return 2
-              except (HTTPError, URLError, ValueError, KeyError, TimeoutError):
-                  print("Report publication failed; consult this workflow run's summary.")
-                  return 2
-              return 0 if report["public_sitemap"].get("expected_urls_match") and report["search_console"]["status"] == "six_urls_recognized" else 1
+              # The always() finalizer sends only required notifications, then persists state.
+              # Pending/partial Google processing is a valid observation, not a failed check.
+              return 1 if check_failed(report) else 0
 
 
           if __name__ == "__main__":
-              raise SystemExit(main())
+              raise SystemExit(gate() if "--gate" in sys.argv else main())
 
           PY
-      - name: Envoyer le resultat par e-mail
-        if: ${{ always() }}
-        env:
-          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
-        shell: bash
-        run: |
-          python - <<'PY'
+          cat > notify_sitemap.py <<'PY'
           """Send one transactional result email per GitHub workflow attempt via Resend."""
           from __future__ import annotations
 
@@ -201,6 +276,7 @@ jobs:
           from urllib.error import HTTPError, URLError
           from urllib.request import Request, urlopen
           from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+          import monitor_sitemap as monitor
 
           REPO = "Sotani77/referentiel-conformite-btp"
           BASE = "https://sotani77.github.io/referentiel-conformite-btp/"
@@ -257,6 +333,8 @@ jobs:
               public = report["public_sitemap"]
               status = google.get("status", "monitor_failed")
               title = LABELS.get(status, "Contrôle Google : résultat indéterminé")
+              if report.get("monitoring_errors"):
+                  title = "Échec du suivi automatique — " + title
               if public.get("expected_urls_match") is False:
                   title = "Anomalie du sitemap public — " + title
               count = google.get("web_urls_reported")
@@ -267,10 +345,13 @@ jobs:
                        f"Avertissements Google : {google.get('warnings', 'non disponible')}",
                        f"Dernière récupération Google : {paris_date(google.get('last_downloaded'))}",
                        f"Sitemap public : HTTP {public.get('http_status', 'non disponible')}, {public.get('url_count', 'non disponible')} URL",
-                       "", f"Sitemap : {SITEMAP}", f"Rapport du contrôle : {report['run_url']}", "",
+                       "", f"Sitemap : {SITEMAP}", f"Rapport du contrôle : {report['run_url']}",
+                       "Erreurs du suivi : " + (", ".join(report.get("monitoring_errors", [])) or "aucune"), "",
                        "Le nombre d’URL reconnues dans le sitemap ne prouve pas leur indexation dans les résultats de recherche.",
                        "Un accès HTTP 200 au sitemap public ne prouve pas sa découverte par Google.", "",
                        "Notification automatique demandée pour le contrôle Legibat. Elle est envoyée depuis GitHub Actions, même si votre ordinateur et Codex sont fermés."]
+              if monitor.goal_reached(report):
+                  lines.append("Objectif atteint : les contrôles Google s’arrêteront après l’envoi et l’enregistrement de ce résultat.")
               text = "\n".join(lines)
               body = ('<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>'
                       + html.escape(title) + '</title></head><body style="font-family:Arial,sans-serif;line-height:1.6;color:#172b40;max-width:640px;margin:24px auto;padding:0 20px">'
@@ -312,10 +393,50 @@ jobs:
                   time.sleep(delay)
 
 
+          def record_email_result(report, result):
+              report["notification"]["email"] = result
+              if result["status"] == "failed":
+                  report.setdefault("monitoring_errors", []).append("email_notification_failed")
+                  report["notification"]["check_failed"] = True
+                  report["notification"]["reasons"].append("email_failed")
+              report["monitoring"]["completed"] = (monitor.goal_reached(report)
+                  and not report.get("monitoring_errors") and result["status"] == "accepted")
+              for event in report["events"]:
+                  if event["id"] == report["notification"]["event_id"]:
+                      event.update({"email": result, "check_failed": report["notification"]["check_failed"],
+                                    "monitoring_errors": report.get("monitoring_errors", []),
+                                    "reasons": list(report["notification"]["reasons"])})
+
+
+          def finalize(report, previous, key, idempotency):
+              if "notification" not in report:
+                  monitor.apply_policy(report, previous)
+              if report["notification"]["required"]:
+                  result = send_email(email_payload(report), key, idempotency) if key else {"status": "failed", "reason": "missing_resend_api_key"}
+              else:
+                  result = {"status": "skipped_unchanged"}
+              record_email_result(report, result)
+              persisted = False
+              try:
+                  persisted = monitor.publish_report(report)
+              except Exception:
+                  pass
+              if not persisted:
+                  report.setdefault("monitoring_errors", []).append("report_publication_failed")
+                  monitor.apply_policy(report, previous)
+                  result = send_email(email_payload(report), key, idempotency + "/publication") if key else {"status": "failed", "reason": "missing_resend_api_key"}
+                  record_email_result(report, result)
+                  try:
+                      persisted = monitor.publish_report(report)
+                  except Exception:
+                      pass
+              Path("sitemap-report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+              result = dict(result, run_url=report["run_url"], checked_at=report["checked_at"],
+                            search_console_status=report["search_console"].get("status"), report_persisted=persisted)
+              return result, (0 if persisted and result["status"] != "failed" and not monitor.check_failed(report) else 1)
+
+
           def main():
-              if os.environ.get("GITHUB_EVENT_NAME") == "schedule" and datetime.now(timezone.utc).year != 2026:
-                  print("One-time October 2026 check: no email in later years.")
-                  return 0
               if os.environ.get("GITHUB_REPOSITORY") != REPO:
                   print("Email refused outside the configured repository.")
                   return 2
@@ -326,20 +447,56 @@ jobs:
                   return 2
               run_url = f"https://github.com/{REPO}/actions/runs/{run_id}"
               report = load_report("sitemap-report.json", run_url)
+              report["runner"] = "GitHub Actions"
+              report["run_attempt"] = int(run_attempt)
+              report["expected_url_count"] = 6
               key = os.environ.get("RESEND_API_KEY", "").strip()
-              result = send_email(email_payload(report), key, f"legibat-sitemap/{run_id}/{run_attempt}") if key else {"status": "failed", "reason": "missing_resend_api_key"}
-              result.update({"run_url": run_url, "checked_at": report["checked_at"], "search_console_status": report["search_console"].get("status")})
+              result, exit_code = finalize(report, monitor.previous_report(), key, f"legibat-sitemap/{run_id}/{run_attempt}")
               Path("email-notification.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
               print(json.dumps(result, indent=2))
               summary = os.environ.get("GITHUB_STEP_SUMMARY")
               if summary:
                   with open(summary, "a", encoding="utf-8") as out:
-                      label = "Acceptée par le service d’envoi (livraison à confirmer)" if result["status"] == "accepted" else "Échec de l’envoi : " + result["reason"]
+                      label = {"accepted": "Acceptée par le service d’envoi (livraison à confirmer)",
+                               "skipped_unchanged": "État inchangé : aucun e-mail envoyé"}.get(result["status"], "Échec de l’envoi : " + result.get("reason", "inconnu"))
                       out.write("\n### Notification e-mail\n\n" + label + ".\n\nIdentifiant : " + result.get("email_id", "aucun") + ".\n")
-              return 0 if result["status"] == "accepted" else 1
+                      out.write("\nRapport enregistré : " + str(result["report_persisted"]) + ".\n")
+                      out.write("\nSuivi terminé : " + str(report["monitoring"]["completed"]) + ".\n")
+              return exit_code
 
 
           if __name__ == "__main__":
               raise SystemExit(main())
 
           PY
+      - name: Lire le dernier etat et verifier l arret
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python monitor_sitemap.py --gate
+      - name: Authentification Google sans cle permanente
+        if: ${{ steps.gate.outputs.should_run == 'true' }}
+        id: google_auth
+        continue-on-error: true
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: vocalys-play-billing
+          workload_identity_provider: projects/851815718809/locations/global/workloadIdentityPools/legibat-sitemap/providers/github
+          service_account: legibat-sitemap-monitor@vocalys-play-billing.iam.gserviceaccount.com
+          token_format: access_token
+          access_token_scopes: https://www.googleapis.com/auth/webmasters.readonly
+          access_token_lifetime: 600s
+          create_credentials_file: false
+          export_environment_variables: false
+      - name: Verifier Search Console et comparer les etats
+        if: ${{ steps.gate.outputs.should_run == 'true' }}
+        env:
+          GSC_ACCESS_TOKEN: ${{ steps.google_auth.outputs.access_token }}
+          MONITOR_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python monitor_sitemap.py
+      - name: Notifier si changement ou echec et enregistrer le rapport
+        if: ${{ always() && steps.gate.outputs.should_run != 'false' }}
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: python notify_sitemap.py
