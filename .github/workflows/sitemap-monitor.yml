@@ -2,8 +2,8 @@ name: Controle sitemap Legibat
 on:
   workflow_dispatch:
   schedule:
-    # 25 octobre 2026, 04:05 Paris = 03:05 UTC (passage heure d'hiver).
-    - cron: '5 3 25 10 *'
+    # Controle unique le 26 octobre 2026, 11:45 Paris = 10:45 UTC.
+    - cron: '45 10 26 10 *'
 permissions:
   contents: write
   id-token: write
