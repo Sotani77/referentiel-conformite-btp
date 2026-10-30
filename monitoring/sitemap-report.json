@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-10-29T17:05:26.224563+00:00",
+  "checked_at": "2026-10-30T16:50:03.631984+00:00",
   "runner": "GitHub Actions",
   "property": "https://sotani77.github.io/referentiel-conformite-btp/",
   "sitemap": "https://sotani77.github.io/referentiel-conformite-btp/sitemap.xml",
@@ -21,7 +21,7 @@
     "indexing_confirmed": false,
     "count_source": "Search Console API contents[type=web].submitted"
   },
-  "run_url": "https://github.com/Sotani77/referentiel-conformite-btp/actions/runs/40917928245",
+  "run_url": "https://github.com/Sotani77/referentiel-conformite-btp/actions/runs/41093430816",
   "note": "Public HTTP success is not Google discovery. Sitemap URL counts are not indexation counts.",
   "monitoring_errors": [],
   "policy_version": 2,
@@ -30,7 +30,7 @@
     "reasons": [],
     "state_changed": false,
     "check_failed": false,
-    "event_id": "40917928245/1",
+    "event_id": "41093430816/1",
     "email": {
       "status": "skipped_unchanged"
     }
