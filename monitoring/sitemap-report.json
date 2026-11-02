@@ -1,12 +1,12 @@
 {
-  "checked_at": "2026-11-01T16:55:05.630315+00:00",
+  "checked_at": "2026-11-02T20:30:53.854088+00:00",
   "runner": "GitHub Actions",
   "property": "https://sotani77.github.io/referentiel-conformite-btp/",
   "sitemap": "https://sotani77.github.io/referentiel-conformite-btp/sitemap.xml",
-  "expected_url_count": 6,
+  "expected_url_count": 11,
   "public_sitemap": {
     "http_status": 200,
-    "url_count": 6,
+    "url_count": 11,
     "expected_urls_match": true
   },
   "search_console": {
@@ -21,24 +21,64 @@
     "indexing_confirmed": false,
     "count_source": "Search Console API contents[type=web].submitted"
   },
-  "run_url": "https://github.com/Sotani77/referentiel-conformite-btp/actions/runs/41328747845",
+  "run_url": "https://github.com/Sotani77/referentiel-conformite-btp/actions/runs/41519861249",
   "note": "Public HTTP success is not Google discovery. Sitemap URL counts are not indexation counts.",
   "monitoring_errors": [],
   "policy_version": 2,
   "notification": {
-    "required": false,
-    "reasons": [],
-    "state_changed": false,
+    "required": true,
+    "reasons": [
+      "state_changed"
+    ],
+    "state_changed": true,
     "check_failed": false,
-    "event_id": "41328747845/1",
+    "event_id": "41519861249/1",
     "email": {
-      "status": "skipped_unchanged"
+      "status": "accepted",
+      "email_id": "01a19df5-3218-7057-b2eb-45e61652bac1",
+      "attempts": 1,
+      "delivery_confirmed": false
     }
   },
   "monitoring": {
     "goal_reached": false,
     "completed": false
   },
-  "events": [],
+  "events": [
+    {
+      "id": "41519861249/1",
+      "checked_at": "2026-11-02T20:30:53.854088+00:00",
+      "run_url": "https://github.com/Sotani77/referentiel-conformite-btp/actions/runs/41519861249",
+      "expected_url_count": 11,
+      "reasons": [
+        "state_changed"
+      ],
+      "check_failed": false,
+      "search_console": {
+        "status": "pending_or_not_downloaded",
+        "web_urls_reported": null,
+        "errors": 0,
+        "warnings": 0,
+        "is_pending": true,
+        "last_downloaded": null,
+        "last_submitted": "2026-10-24T03:00:21.673Z",
+        "sitemap_type": null,
+        "indexing_confirmed": false,
+        "count_source": "Search Console API contents[type=web].submitted"
+      },
+      "public_sitemap": {
+        "http_status": 200,
+        "url_count": 11,
+        "expected_urls_match": true
+      },
+      "monitoring_errors": [],
+      "email": {
+        "status": "accepted",
+        "email_id": "01a19df5-3218-7057-b2eb-45e61652bac1",
+        "attempts": 1,
+        "delivery_confirmed": false
+      }
+    }
+  ],
   "run_attempt": 1
 }
